@@ -1,15 +1,12 @@
 import json
 import math
-from auto_gptq.nn_modules.qlinear.qlinear_marlin import QuantLinear
+from auto_gptq.nn_modules.qlinear.qlinear_cuda_old import QuantLinear  # gptq
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from datasets import load_dataset, load_from_disk
-from typing import List
 from torch.optim import AdamW
 from torch.utils.data import Dataset, DataLoader
 from transformers import AutoModelForCausalLM, AutoTokenizer, get_linear_schedule_with_warmup
-from peft import LoraConfig, get_peft_model, TaskType
 from tqdm import tqdm
 import argparse
 
@@ -35,13 +32,16 @@ class LoRALayer(nn.Module):
             param.requires_grad = False
 
         # 获取原始层的参数
-        in_features = original_layer.in_features
-        out_features = original_layer.out_features
-
-        # LoRA的A矩阵 (向下投影)
-        self.lora_A = nn.Parameter(torch.zeros((rank, in_features)))
-        # LoRA的B矩阵 (向上投影)
-        self.lora_B = nn.Parameter(torch.zeros((out_features, rank)))
+        if isinstance(original_layer, nn.Linear):  # 未量化
+            in_features = original_layer.in_features
+            out_features = original_layer.out_features
+            self.lora_A = nn.Parameter(torch.zeros((rank, in_features)))  # LoRA的A矩阵 (向下投影)
+            self.lora_B = nn.Parameter(torch.zeros((out_features, rank)))  # LoRA的B矩阵 (向上投影)
+        elif isinstance(original_layer, QuantLinear):  # gptq 量化
+            in_features = original_layer.infeatures
+            out_features = original_layer.outfeatures
+            self.lora_A = nn.Parameter(torch.zeros((rank, in_features), dtype=torch.half))
+            self.lora_B = nn.Parameter(torch.zeros((out_features, rank), dtype=torch.half))
 
         # 初始化
         self.reset_parameters()
@@ -77,18 +77,16 @@ def apply_lora(model, target_modules=["q_proj", "k_proj", "v_proj", "o_proj"], r
     """
     将LoRA应用于模型中的特定模块
     """
-    named_modules_list = model.named_modules()
     for name, module in model.named_modules():
+        # 替换原始线性层为LoRALayer
         if any(target in name for target in target_modules):
             if isinstance(module, nn.Linear):
-                # 替换原始线性层为LoRALayer
                 parent = model
                 path = name.split('.')
                 for p in path[:-1]:
                     parent = getattr(parent, p)
                 setattr(parent, path[-1], LoRALayer(module, rank, alpha))
             elif isinstance(module, QuantLinear):
-                # 替换原始线性层为LoRALayer
                 parent = model
                 path = name.split('.')
                 for p in path[:-1]:
@@ -127,10 +125,10 @@ def train_epoch(model, train_loader, optimizer, device, accumulation_steps=4):
                         attention_mask=attention_mask,
                         labels=labels)
         loss = outputs.loss
-        loss = loss / accumulation_steps  # 梯度累积
+        loss = loss / accumulation_steps
 
         loss.backward()
-
+        # 梯度累积
         if (i + 1) % accumulation_steps == 0:
             optimizer.step()
             optimizer.zero_grad()
@@ -145,19 +143,51 @@ def prepare_dataloader(tokenizer, dataset, batch_size=4):
     准备数据加载器
     """
 
+
     def collate_fn(batch):
-        texts = [item["text"] for item in batch]
-        inputs = tokenizer(
-            texts,
+        input_texts, target_texts = [], []
+        for item in batch:
+            prompt = '''f"<|im_start|>user\n{input}<|im_end|>\n<|im_start|>assistant\n"'''
+            prompt = prompt.replace("{input}", item["instruction"] + item["input"])
+            input_texts.append(prompt)
+            output = prompt + item["output"]
+            target_texts.append(output)
+
+        # 对于SFT，我们只需要计算response部分的loss
+        input_encodings = tokenizer(
+            input_texts,
             padding=True,
             truncation=True,
-            max_length=512,
+            max_length=128,
+            return_tensors="pt"
+        )
+        # 首先找到 input 的长度`
+        input_len = input_encodings["input_ids"].shape[1]
+
+        target_encodings = tokenizer(
+            target_texts,
+            padding=True,
+            truncation=True,
+            max_length=128,
             return_tensors="pt"
         )
 
-        # 对于因果语言建模，标签就是输入的偏移版本
-        inputs["labels"] = inputs["input_ids"].clone()
-        return inputs
+        # 创建attention mask
+        target_ids = target_encodings["input_ids"].squeeze()
+        attention_mask = target_encodings["attention_mask"].squeeze()
+
+        # 创建labels，将 input 部分设置为-100（在计算loss时忽略）
+        labels = target_ids.clone()
+        for label in labels:
+            label[:input_len] = -100
+
+        samples = {
+            "input_ids": target_ids,
+            "attention_mask": attention_mask,
+            "labels": labels
+        }
+
+        return samples
 
     return torch.utils.data.DataLoader(
         dataset,
@@ -168,18 +198,33 @@ def prepare_dataloader(tokenizer, dataset, batch_size=4):
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    # "model_name": r"F:\inspur\LLM_MODEL\Qwen\Qwen2___5-0___5B-Instruct",
+    parser.add_argument("--model_name", type=str,
+                        default=r"F:\inspur\LLM_MODEL\Qwen\Qwen2___5-0___5B-Instruct-GPTQ-Int4", help="预训练模型名称")
+    parser.add_argument("--device", type=str, default="cuda", help="")
+    parser.add_argument("--dataset", type=str, default=r"F:\inspur\GPU\code\LLM-FineTuning\data\alpaca_zh_demo.json",
+                        help="")
+    parser.add_argument("--batch_size", type=int, default=4, help="batch size")
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=4, help="梯度累积步数")
+    parser.add_argument("--learning_rate", type=float, default=5e-5, help="学习率")
+    parser.add_argument("--epochs", type=int, default=3, help="训练轮数")
+    parser.add_argument("--warmup_steps", type=int, default=100, help="预热步数")
+    parser.add_argument("--lora_rank", type=int, default=8, help="lora rank")
+    parser.add_argument("--lora_alpha", type=float, default=16.0, help="")
+
+    args = parser.parse_args()
+
     # 配置参数
     config = {
-        "model_name": r"F:\inspur\LLM_MODEL\Qwen\Qwen2___5-0___5B-Instruct",
-        # "model_name": r"F:\inspur\LLM_MODEL\Qwen\Qwen2___5-0___5B-Instruct-GPTQ-Int4",
-        "batch_size": 1,
-        "accumulation_steps": 4,
-        "learning_rate": 1e-4,
-        "epochs": 1,
-        "lora_rank": 8,
-        "lora_alpha": 16,
-        "device": "cpu"
-        # "device": "cuda" if torch.cuda.is_available() else "cpu"
+        "model_name": args.model_name,
+        "batch_size": args.batch_size,
+        "accumulation_steps": args.gradient_accumulation_steps,
+        "learning_rate": args.learning_rate,
+        "epochs": args.epochs,
+        "lora_rank": args.lora_rank,
+        "lora_alpha": args.lora_alpha,
+        "device": args.device,
     }
 
     # 准备模型和tokenizer
@@ -187,7 +232,10 @@ def main():
     model.to(config["device"])
 
     # 示例数据集 - 替换为你的实际数据
-    dataset = [{"text": "这是一条示例文本1"}, {"text": "这是一条示例文本2"}]
+    if isinstance(args.dataset, str):
+        with open(args.dataset, "r", encoding="utf-8") as f:
+            dataset = json.load(f)
+    # dataset = [{"text": "这是一条示例文本1"}, {"text": "这是一条示例文本2"}]
 
     # 准备数据加载器
     train_loader = prepare_dataloader(tokenizer, dataset, config["batch_size"])
