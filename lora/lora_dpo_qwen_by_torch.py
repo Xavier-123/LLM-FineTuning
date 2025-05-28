@@ -107,7 +107,7 @@ class DPODataset(Dataset):
         rejected = self.rejected_responses[idx]
 
         chosen_encodings = self.tokenizer(
-            prompt + chosen,
+            prompt[0]["value"] + chosen["value"],
             truncation=True,
             max_length=self.max_length,
             padding='max_length',
@@ -115,7 +115,7 @@ class DPODataset(Dataset):
         )
 
         rejected_encodings = self.tokenizer(
-            prompt + rejected,
+            prompt[0]["value"] + rejected["value"],
             truncation=True,
             max_length=self.max_length,
             padding='max_length',  # ['longest', 'max_length', 'do_not_pad']
@@ -243,6 +243,7 @@ def train_epoch(model, reference_model, train_loader, optimizer, scheduler, devi
                 policy_chosen_logps, policy_rejected_logps,
                 ref_chosen_logps, ref_rejected_logps
             )
+            print(f"step {batch_idx + 1} loss: {loss}")
 
             # 反向传播
             optimizer.zero_grad()
@@ -288,11 +289,11 @@ def main():
 
     with open("F:\inspur\GPU\code\LLM-FineTuning\data\dpo_zh_demo.json", "r", encoding="utf-8") as f:
         train_data = json.load(f)
-    print(train_data)
+    # print(train_data)
 
     # 创建数据集和数据加载器
     train_dataset = DPODataset(train_data, tokenizer)
-    train_loader = DataLoader(train_dataset, batch_size=4, shuffle=True)
+    train_loader = DataLoader(train_dataset, batch_size=2, shuffle=True)
 
     # 设置优化器和学习率调度器
     optimizer = AdamW(model.parameters(), lr=5e-6)

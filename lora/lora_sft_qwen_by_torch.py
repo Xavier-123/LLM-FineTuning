@@ -1,14 +1,16 @@
 import json
 import math
+import argparse
+from tqdm import tqdm
 from auto_gptq.nn_modules.qlinear.qlinear_cuda_old import QuantLinear  # gptq
+from lora.utils import CustomDatasetSFT
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import AdamW
 from torch.utils.data import Dataset, DataLoader
 from transformers import AutoModelForCausalLM, AutoTokenizer, get_linear_schedule_with_warmup
-from tqdm import tqdm
-import argparse
+
 
 
 class LoRALayer(nn.Module):
@@ -126,6 +128,7 @@ def train_epoch(model, train_loader, optimizer, device, accumulation_steps=4):
                         labels=labels)
         loss = outputs.loss
         loss = loss / accumulation_steps
+        print(f"step {1+1} loss: {loss}")
 
         loss.backward()
         # 梯度累积
@@ -238,7 +241,10 @@ def main():
     # dataset = [{"text": "这是一条示例文本1"}, {"text": "这是一条示例文本2"}]
 
     # 准备数据加载器
-    train_loader = prepare_dataloader(tokenizer, dataset, config["batch_size"])
+    train_dataset = CustomDatasetSFT(tokenizer=tokenizer, data=args.dataset)
+    train_loader = DataLoader(train_dataset, batch_size=config["batch_size"], shuffle=True)
+    # train_loader = prepare_dataloader(tokenizer, dataset, config["batch_size"])
+
 
     # 准备优化器 - 只训练LoRA参数
     optimizer = AdamW(
