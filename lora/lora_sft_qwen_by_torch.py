@@ -7,10 +7,10 @@ from lora.utils import CustomDatasetSFT
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn import CrossEntropyLoss
 from torch.optim import AdamW
 from torch.utils.data import Dataset, DataLoader
 from transformers import AutoModelForCausalLM, AutoTokenizer, get_linear_schedule_with_warmup
-
 
 
 class LoRALayer(nn.Module):
@@ -110,7 +110,53 @@ def prepare_model_and_tokenizer(model_name="Qwen/Qwen-1_8B"):
     return model, tokenizer
 
 
-def train_epoch(model, train_loader, optimizer, device, accumulation_steps=4):
+# 训练数据预处理方法
+def preprocess(tokenizer, batch_messages):
+    input_list = []
+    target_list = []
+
+    im_start = tokenizer('<|im_start|>').input_ids
+    im_end = tokenizer('<|im_end|>').input_ids
+    newline = tokenizer('\n').input_ids
+    pad = tokenizer('<|endoftext|>').input_ids
+    ignore = [-100]
+
+    for group in batch_messages:
+        input_ids = []
+        target_ids = []
+        for msg in group:
+            role = tokenizer(msg['role']).input_ids
+            content = tokenizer(msg['content']).input_ids
+            if msg['role'] in ['system', 'user']:
+                ignore_parts = role + newline + content
+                input_ids += im_start + ignore_parts + im_end + newline
+                target_ids += im_start + ignore * len(ignore_parts) + im_end + newline
+            else:
+                ignore_parts = role + newline
+                input_ids += im_start + ignore_parts + content + im_end + newline
+                target_ids += im_start + ignore * len(ignore_parts) + content + im_end + newline
+        input_list.append(input_ids)
+        target_list.append(target_ids)
+
+    # padding
+    max_len = max([len(ids) for ids in input_list])
+    for input_ids, target_ids in zip(input_list, target_list):
+        input_ids += pad * (max_len - len(input_ids))
+        target_ids += ignore * (max_len - len(target_ids))
+
+    batch_input_ids = torch.tensor(input_list, dtype=torch.long)
+    batch_target_ids = torch.tensor(target_list, dtype=torch.long)
+    batch_mask = batch_input_ids.ne(pad[0]).type(torch.long)
+    return batch_input_ids, batch_target_ids, batch_mask
+
+
+def train_epoch(model,
+                train_loader,
+                batch_input_ids,
+                batch_target_ids,
+                batch_mask,
+                loss_fn,
+                optimizer, device, accumulation_steps=4):
     """
     训练一个epoch
     """
@@ -118,17 +164,23 @@ def train_epoch(model, train_loader, optimizer, device, accumulation_steps=4):
     total_loss = 0
     optimizer.zero_grad()
 
+
     for i, batch in enumerate(tqdm(train_loader)):
+        # input_ids = batch["input_ids"].to(device)
+        # attention_mask = batch["attention_mask"].to(device)
+        # labels = batch["labels"].to(device)
+
         input_ids = batch["input_ids"].to(device)
         attention_mask = batch["attention_mask"].to(device)
-        labels = batch["labels"].to(device)
+        labels = batch["target_ids"].to(device)
 
         outputs = model(input_ids=input_ids,
                         attention_mask=attention_mask,
                         labels=labels)
+        outputs_logps = outputs.logits.log_softmax(dim=-1)
         loss = outputs.loss
         loss = loss / accumulation_steps
-        print(f"step {1+1} loss: {loss}")
+        print(f"step {1 + 1} loss: {loss}")
 
         loss.backward()
         # 梯度累积
@@ -145,7 +197,6 @@ def prepare_dataloader(tokenizer, dataset, batch_size=4):
     """
     准备数据加载器
     """
-
 
     def collate_fn(batch):
         input_texts, target_texts = [], []
@@ -238,13 +289,23 @@ def main():
     if isinstance(args.dataset, str):
         with open(args.dataset, "r", encoding="utf-8") as f:
             dataset = json.load(f)
-    # dataset = [{"text": "这是一条示例文本1"}, {"text": "这是一条示例文本2"}]
+            messages = []
+            for data in dataset:
+                tmp = []
+                tmp.append({"role": "system", "content": "You are a helpful assistant."})
+                tmp.append({"role": "user", "content": data["instruction"] + data["input"]})
+                tmp.append({"role": "assistant", "content": data["output"]})
+                messages.append(tmp)
+    print(messages)
+    batch_input_ids, batch_target_ids, batch_mask = preprocess(tokenizer, messages)
 
     # 准备数据加载器
     train_dataset = CustomDatasetSFT(tokenizer=tokenizer, data=args.dataset)
     train_loader = DataLoader(train_dataset, batch_size=config["batch_size"], shuffle=True)
     # train_loader = prepare_dataloader(tokenizer, dataset, config["batch_size"])
 
+    # 损失函数
+    loss_fn = CrossEntropyLoss()
 
     # 准备优化器 - 只训练LoRA参数
     optimizer = AdamW(
@@ -257,6 +318,10 @@ def main():
         avg_loss = train_epoch(
             model,
             train_loader,
+            batch_input_ids,
+            batch_target_ids,
+            batch_mask,
+            loss_fn,
             optimizer,
             config["device"],
             config["accumulation_steps"]
