@@ -118,7 +118,7 @@ def preprocess(tokenizer, batch_messages):
     im_start = tokenizer('<|im_start|>').input_ids
     im_end = tokenizer('<|im_end|>').input_ids
     newline = tokenizer('\n').input_ids
-    pad = tokenizer('<|endoftext|>').input_ids
+    pad = tokenizer('<|endoftext|>').input_ids            # 给attention mask使用
     ignore = [-100]
 
     for group in batch_messages:
@@ -127,14 +127,23 @@ def preprocess(tokenizer, batch_messages):
         for msg in group:
             role = tokenizer(msg['role']).input_ids
             content = tokenizer(msg['content']).input_ids
+            # if msg['role'] in ['system', 'user']:
+            #     ignore_parts = role + newline + content
+            #     input_ids += im_start + ignore_parts + im_end + newline
+            #     target_ids += im_start + ignore * len(ignore_parts) + im_end + newline
+            # else:
+            #     ignore_parts = role + newline
+            #     input_ids += im_start + ignore_parts + content + im_end + newline
+            #     target_ids += im_start + ignore * len(ignore_parts) + content + im_end + newline
+
             if msg['role'] in ['system', 'user']:
-                ignore_parts = role + newline + content
-                input_ids += im_start + ignore_parts + im_end + newline
-                target_ids += im_start + ignore * len(ignore_parts) + im_end + newline
+                ignore_parts = im_start + role + newline + content + im_end + newline
+                input_ids += ignore_parts
+                target_ids += ignore * len(ignore_parts)
             else:
-                ignore_parts = role + newline
-                input_ids += im_start + ignore_parts + content + im_end + newline
-                target_ids += im_start + ignore * len(ignore_parts) + content + im_end + newline
+                ignore_parts = im_start + role + newline
+                input_ids += ignore_parts + content + im_end + newline
+                target_ids += ignore * len(ignore_parts) + content + im_end + newline
         input_list.append(input_ids)
         target_list.append(target_ids)
 
@@ -146,8 +155,8 @@ def preprocess(tokenizer, batch_messages):
 
     batch_input_ids = torch.tensor(input_list, dtype=torch.long)
     batch_target_ids = torch.tensor(target_list, dtype=torch.long)
-    batch_mask = batch_input_ids.ne(pad[0]).type(torch.long)
-    return batch_input_ids, batch_target_ids, batch_mask
+    batch_attention_mask = batch_input_ids.ne(pad[0]).type(torch.long)
+    return batch_input_ids, batch_target_ids, batch_attention_mask
 
 
 def train_epoch(model,
@@ -163,7 +172,6 @@ def train_epoch(model,
     model.train()
     total_loss = 0
     optimizer.zero_grad()
-
 
     for i, batch in enumerate(tqdm(train_loader)):
         # input_ids = batch["input_ids"].to(device)
@@ -285,19 +293,49 @@ def main():
     model, tokenizer = prepare_model_and_tokenizer(config["model_name"])
     model.to(config["device"])
 
-    # 示例数据集 - 替换为你的实际数据
+    # 准备数据集
+    # 方式1：load_dataset
+    from datasets import load_dataset
     if isinstance(args.dataset, str):
-        with open(args.dataset, "r", encoding="utf-8") as f:
-            dataset = json.load(f)
-            messages = []
-            for data in dataset:
-                tmp = []
-                tmp.append({"role": "system", "content": "You are a helpful assistant."})
-                tmp.append({"role": "user", "content": data["instruction"] + data["input"]})
-                tmp.append({"role": "assistant", "content": data["output"]})
-                messages.append(tmp)
-    print(messages)
-    batch_input_ids, batch_target_ids, batch_mask = preprocess(tokenizer, messages)
+        sft_dataset = load_dataset(
+            path="json",
+            name=None,
+            data_dir=None,
+            data_files=['../data/alpaca_zh_demo.json'],
+            split='train',
+            cache_dir=None,
+            token=None,
+            num_proc=1,
+            trust_remote_code=True,
+            streaming=False,
+        )
+        split_dataset = sft_dataset.train_test_split(test_size=0.3, seed=1)
+        train_dataset = split_dataset["train"]
+        test_dataset = split_dataset["test"]
+
+        # 对数据预处理
+        # 可参考 llamafactory/data/processor/supervised.py
+        format_system = '<|im_start|>system\n{{content}}<|im_end|>\n'
+        format_user = '<|im_start|>user\n{{content}}<|im_end|>\n<|im_start|>assistant\n'
+        format_assistant = '{{content}}<|im_end|>\n'
+        pass
+
+        # 示例数据集 - 替换为你的实际数据
+        messages = []
+        for data in test_dataset:
+            tmp = []
+            tmp.append({"role": "system", "content": "You are a helpful assistant."})
+            tmp.append({"role": "user", "content": data["instruction"] + data["input"]})
+            tmp.append({"role": "assistant", "content": data["output"]})
+            messages.append(tmp)
+        # print(messages)
+        batch_input_ids, batch_target_ids, batch_mask = preprocess(tokenizer, messages)
+
+    # 方式2：自定义dataset
+    sft_dataset = CustomDatasetSFT(tokenizer, data="../data/alpaca_zh_demo.json", max_length=256)
+
+
+
 
     # 准备数据加载器
     train_dataset = CustomDatasetSFT(tokenizer=tokenizer, data=args.dataset)

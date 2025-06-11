@@ -3,6 +3,7 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 from transformers import AutoTokenizer
 from datasets import load_dataset
+from collections import defaultdict
 
 # bos_token`, `eos_token`, `unk_token`, `sep_token`, `pad_token`, `cls_token`, `mask_token`,
 
@@ -22,21 +23,42 @@ dataset = load_dataset(
 )
 '''
 
+dataset_sample = {
+    "input_ids": "input_ids",                # 输入： system + user + assistant
+    "attention_mask": "attention_mask",      # [1] * len(system + user + assistant)，超过部分设置为
+    # 0，（在llamafactory中，会将长度处理为 2 的倍数，暂时没见到奇数长度）
+    "labels": "labels"                       # 标签： 除了assistant部分其它全为为-100（ [-100]*len(system + user) + assistant
+    # ），以及 attention_mask为0部分设置为 -100
+}
+
 
 class CustomDatasetSFT(Dataset):
+    ''' 为了适配自己的数据类型'''
     def __init__(self, tokenizer, data="../../data/alpaca_zh_demo.json", max_length=256):
         super().__init__()
-        if isinstance(data, str):
-            with open(data, "r", encoding="utf-8") as file:
-                data_samples = json.load(file)
+
+        self.load_data()
+        self.data = data
         self.tokenizer = tokenizer
         self.max_length = max_length
-        self.data_samples = data_samples
         self.im_start = self.tokenizer('<|im_start|>').input_ids  # 开始 token
         self.im_end = self.tokenizer('<|im_end|>').input_ids  # 结束 token
         self.newline = self.tokenizer('\n').input_ids  # 换行
         self.pad = self.tokenizer('<|endoftext|>').input_ids  # padding token
         self.ignore = [-100]
+
+    def load_data(self):
+        if isinstance(self.data, str):
+            # 判断是什么类型数据
+            if self.data.endswith(".json") or self.data.endswith(".jsonl"):
+                with open(self.data, "r", encoding="utf-8") as file:
+                    data_samples = json.load(file)
+            elif self.data.endswith(".csv"):
+                pass
+            elif self.data.endswith(".excel"):
+                pass
+        self.data_samples = data_samples
+
 
     def __len__(self):
         return len(self.data_samples)
@@ -97,55 +119,9 @@ class CustomDatasetSFT(Dataset):
 
         return samples
 
-    def __getitem2__(self, idx):
-        instruction = self.data_samples[idx]['instruction']
-        input = self.data_samples[idx]['input']
-        output = self.data_samples[idx]['output']
-
-        prompt = '''f<|im_start|>user\n{input}<|im_end|>\n<|im_start|>assistant\n'''
-        prompt = prompt.replace("{input}", instruction + '\n' + input)
-        output = prompt + output
-
-        # 对于SFT，我们只需要计算response部分的loss
-        # padding='longest': 填充至批次最长长度; padding='max_length': 填充至模型最大长度; padding='max_length,max_length=128: 填充至指定长度
-        # 需要计算有效长度，是不是不应该填充
-        input_encodings = self.tokenizer(
-            prompt,
-            truncation=True,
-            max_length=self.max_length,
-            padding='do_not_pad',  # 可选参数：'longest', 'max_length', 'do_not_pad', True
-            return_tensors="pt"
-        )
-        # 首先找到 input 的长度
-        input_len = input_encodings["input_ids"].shape[1]
-
-        target_encodings = self.tokenizer(
-            output,
-            truncation=True,
-            max_length=self.max_length,
-            padding='max_length',
-            return_tensors="pt"
-        )
-
-        # 创建attention mask
-        target_ids = target_encodings["input_ids"].squeeze()
-        attention_mask = target_encodings["attention_mask"].squeeze()
-
-        # 创建labels，将 input 部分设置为-100（在计算loss时忽略）
-        labels = target_ids.clone()
-        labels[:input_len] = -100
-
-        samples = {
-            "input_ids": target_ids,
-            "attention_mask": attention_mask,
-            "labels": labels
-        }
-
-        return samples
-
-
     def __getitem_from_llamafactory__(self, idx):
         model_inputs = defaultdict(list)
+        input_ids, attention_mask, labels =[], [], []
         # 如果有1000条数据，则 len(model_inputs["input_ids"]) == len(model_inputs["attention_mask"]) == 1000
         # model_inputs["input_ids"].append()
         # model_inputs["attention_mask"]
