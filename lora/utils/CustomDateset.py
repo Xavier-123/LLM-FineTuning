@@ -2,9 +2,26 @@ import json
 import torch
 from torch.utils.data import Dataset, DataLoader
 from transformers import AutoTokenizer
-
+from datasets import load_dataset
 
 # bos_token`, `eos_token`, `unk_token`, `sep_token`, `pad_token`, `cls_token`, `mask_token`,
+
+# 加载json文件样例
+'''
+dataset = load_dataset(
+    path="json",
+    name=None,
+    data_dir=None,
+    data_files=['../../data/alpaca_zh_demo.json'],
+    split='train',
+    cache_dir=None,
+    token=None,
+    num_proc=1,
+    trust_remote_code=True,
+    streaming=False,
+)
+'''
+
 
 class CustomDatasetSFT(Dataset):
     def __init__(self, tokenizer, data="../../data/alpaca_zh_demo.json", max_length=256):
@@ -52,7 +69,6 @@ class CustomDatasetSFT(Dataset):
         # _input_str = self.tokenizer.decode(_input_ids, skip_special_tokens=False)
         # input_str = self.tokenizer.decode(input_ids, skip_special_tokens=False)
         labels_ids = input_ids.copy()
-
 
         # input_ids包含所有输入ids
         if len(input_ids) < self.max_length:
@@ -126,6 +142,16 @@ class CustomDatasetSFT(Dataset):
         }
 
         return samples
+
+
+    def __getitem_from_llamafactory__(self, idx):
+        model_inputs = defaultdict(list)
+        # 如果有1000条数据，则 len(model_inputs["input_ids"]) == len(model_inputs["attention_mask"]) == 1000
+        # model_inputs["input_ids"].append()
+        # model_inputs["attention_mask"]
+        # model_inputs["labels"]
+
+        pass
 
 
 def prepare_dataloader(tokenizer, dataset, batch_size=4):
